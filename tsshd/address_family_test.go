@@ -27,6 +27,7 @@ package tsshd
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -302,5 +303,78 @@ func TestAddressFamilyDualStackLoopback(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNoInterfacesFallsBackToSingleFamilyWildcard(t *testing.T) {
+	orig := netInterfaces
+	netInterfaces = func() ([]net.Interface, error) { return nil, errors.New("netlink permission denied") }
+	defer func() { netInterfaces = orig }()
+	t.Setenv("SSH_CONNECTION", "")
+
+	for _, tc := range []struct {
+		name       string
+		ipv4, ipv6 bool
+		want       string
+		needIPv6   bool
+	}{
+		{"IPv4", true, false, "inet", false},
+		{"IPv6", false, true, "inet6", true},
+		{"Any", false, false, "", false},
+	} {
+		for _, tcp := range []bool{false, true} {
+			t.Run(tc.name+"/tcp="+strconv.FormatBool(tcp), func(t *testing.T) {
+				if tc.needIPv6 {
+					requireIPv6Loopback(t)
+				}
+				addrs, err := getUdpAddrs(&tsshdArgs{TCP: tcp, IPv4: tc.ipv4, IPv6: tc.ipv6})
+				if err != nil {
+					t.Fatalf("expected wildcard fallback, got %v", err)
+				}
+				if len(addrs) != 1 || (addrs[0].IP != nil && !addrs[0].IP.IsUnspecified()) {
+					t.Fatalf("expected one wildcard address, got %v", addrs)
+				}
+				var conn frontendConnection
+				if tcp {
+					conn, err = tcpListenOnPort(addrs, 0)
+				} else {
+					conn, err = udpListenOnPort(addrs, 0)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if c, ok := conn.(*udpFrontendConn); ok {
+						for _, l := range c.connList {
+							_ = l.Close()
+						}
+					} else if c, ok := conn.(*tcpFrontendConn); ok {
+						for _, l := range c.listenerList {
+							_ = l.Close()
+						}
+					}
+				}()
+				if got := conn.addressFamily(); got != tc.want {
+					t.Fatalf("address family %q, want %q", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestListenNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		ip   net.IP
+		want string
+	}{
+		{nil, "udp"},
+		{net.IPv4zero, "udp4"},
+		{net.IPv6unspecified, "udp6"},
+		{net.ParseIP("127.0.0.1"), "udp"},
+		{net.ParseIP("::1"), "udp"},
+	} {
+		if got := listenNetwork("udp", tc.ip); got != tc.want {
+			t.Errorf("listenNetwork(%v) = %q, want %q", tc.ip, got, tc.want)
+		}
 	}
 }

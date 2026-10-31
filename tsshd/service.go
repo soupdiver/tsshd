@@ -250,9 +250,9 @@ func canListenOnIP(args *tsshdArgs, udpAddr *net.UDPAddr) bool {
 	var err error
 	var conn io.Closer
 	if args.TCP {
-		conn, err = net.ListenTCP("tcp", &net.TCPAddr{IP: udpAddr.IP, Zone: udpAddr.Zone})
+		conn, err = net.ListenTCP(listenNetwork("tcp", udpAddr.IP), &net.TCPAddr{IP: udpAddr.IP, Zone: udpAddr.Zone})
 	} else {
-		conn, err = net.ListenUDP("udp", udpAddr)
+		conn, err = net.ListenUDP(listenNetwork("udp", udpAddr.IP), udpAddr)
 	}
 	if err != nil {
 		return false
@@ -260,6 +260,9 @@ func canListenOnIP(args *tsshdArgs, udpAddr *net.UDPAddr) bool {
 	_ = conn.Close()
 	return true
 }
+
+// netInterfaces is replaceable in tests.
+var netInterfaces = net.Interfaces
 
 func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
 	ipv4Only := args.IPv4 && !args.IPv6
@@ -304,7 +307,7 @@ func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
 		}
 	}
 
-	ifaces, err := net.Interfaces()
+	ifaces, err := netInterfaces()
 	if err == nil {
 		for _, iface := range ifaces {
 			addrs, err := iface.Addrs()
@@ -322,14 +325,17 @@ func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
 	}
 
 	if len(udpAddrs) == 0 {
-		if ipv4Only || ipv6Only {
-			return nil, fmt.Errorf("no listenable address for the requested IP family (ipv4=%t, ipv6=%t)", ipv4Only, ipv6Only)
+		// No usable interface address, e.g. net.Interfaces is denied on
+		// Android/Termux or in sandboxes: fall back to the wildcard address,
+		// restricted to the requested family (see listenNetwork).
+		switch {
+		case ipv4Only:
+			return []*net.UDPAddr{{IP: net.IPv4zero}}, nil
+		case ipv6Only:
+			return []*net.UDPAddr{{IP: net.IPv6unspecified}}, nil
+		default:
+			return []*net.UDPAddr{{}}, nil
 		}
-		udpAddr, err := net.ResolveUDPAddr("udp", ":0")
-		if err != nil {
-			return nil, err
-		}
-		return []*net.UDPAddr{udpAddr}, nil
 	}
 
 	return udpAddrs, nil
@@ -386,6 +392,7 @@ func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
 
 func udpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
 	var connList []*net.UDPConn
+	var families []string
 	defer func() {
 		if err != nil {
 			for _, conn := range connList {
@@ -396,21 +403,20 @@ func udpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err 
 	for _, addr := range addrs {
 		addr.Port = port
 		var conn *net.UDPConn
-		conn, err = net.ListenUDP("udp", addr)
+		network := listenNetwork("udp", addr.IP)
+		conn, err = net.ListenUDP(network, addr)
 		if err != nil {
 			return nil, err
 		}
 		connList = append(connList, conn)
-	}
-	families := make([]string, 0, len(connList))
-	for _, conn := range connList {
-		families = append(families, listenerAddressFamily(conn.LocalAddr()))
+		families = append(families, socketAddressFamily(network, conn.LocalAddr()))
 	}
 	return &udpFrontendConn{connList: connList, listenFamily: commonAddressFamily(families)}, nil
 }
 
 func tcpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
 	var listenerList []*net.TCPListener
+	families := make(map[*net.TCPListener]string, len(addrs))
 	defer func() {
 		if err != nil {
 			for _, listener := range listenerList {
@@ -420,13 +426,15 @@ func tcpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err 
 	}()
 	for _, addr := range addrs {
 		var listener *net.TCPListener
-		listener, err = net.ListenTCP("tcp", &net.TCPAddr{IP: addr.IP, Port: port, Zone: addr.Zone})
+		network := listenNetwork("tcp", addr.IP)
+		listener, err = net.ListenTCP(network, &net.TCPAddr{IP: addr.IP, Port: port, Zone: addr.Zone})
 		if err != nil {
 			return nil, err
 		}
 		listenerList = append(listenerList, listener)
+		families[listener] = socketAddressFamily(network, listener.Addr())
 	}
-	return &tcpFrontendConn{listenerList: listenerList}, nil
+	return &tcpFrontendConn{listenerList: listenerList, listenerFamily: families}, nil
 }
 
 func listenKCP(conn net.PacketConn, info *ServerInfo, delegToProxy bool) (*kcp.Listener, *rotatingCrypto, error) {

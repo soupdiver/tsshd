@@ -544,7 +544,9 @@ type tcpFrontendConn struct {
 	proxy         *serverProxy
 	listenerMutex sync.Mutex
 	listenerList  []*net.TCPListener
-	frameSignalCh chan *tcpFrameSignal
+	// listenerFamily is fixed at listen time; it is read-only afterwards.
+	listenerFamily map[*net.TCPListener]string
+	frameSignalCh  chan *tcpFrameSignal
 }
 
 func (c *tcpFrontendConn) addressFamily() string {
@@ -552,7 +554,7 @@ func (c *tcpFrontendConn) addressFamily() string {
 	defer c.listenerMutex.Unlock()
 	families := make([]string, 0, len(c.listenerList))
 	for _, listener := range c.listenerList {
-		families = append(families, listenerAddressFamily(listener.Addr()))
+		families = append(families, c.listenerFamily[listener])
 	}
 	return commonAddressFamily(families)
 }
