@@ -342,7 +342,7 @@ func recvMessage(stream io.Reader, msg any) error {
 		return fmt.Errorf("recv message read buffer failed: %w", err)
 	}
 	if err := json.Unmarshal(msgBuf, msg); err != nil {
-		if enableDebugLogging {
+		if enableDebugLogging.Load() {
 			debug("failed to unmarshal message: %s", strconv.QuoteToASCII(string(msgBuf)))
 		}
 		return fmt.Errorf("recv message unmarshal failed: %w", err)

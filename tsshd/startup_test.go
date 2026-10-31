@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -515,5 +516,92 @@ func TestBusStartupRekeyCanceled(t *testing.T) {
 			t.Fatal("rekey did not stop even after publishing a closed bus")
 		}
 		t.Fatal("rekey kept waiting for the bus after startup cleanup")
+	}
+}
+
+func TestBusStartupPhasesHaveSeparateBudgets(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	proto := &startupProtocol{stream: startupPipeStream{conn}, closed: make(chan struct{})}
+	defer proto.closeClient()
+	const timeout = 200 * time.Millisecond
+	// Each phase takes ~60% of ConnectTimeout: together they exceed one budget.
+	delay := timeout * 6 / 10
+	go func() {
+		if _, err := recvCommand(peer); err != nil {
+			return
+		}
+		time.Sleep(delay)
+		if err := sendSuccess(startupPipeStream{peer}); err != nil {
+			return
+		}
+		var msg busMessage
+		if err := recvMessage(peer, &msg); err != nil {
+			return
+		}
+		time.Sleep(delay)
+		_ = sendResponse(startupPipeStream{peer}, &busResponse{})
+	}()
+	client := &SshUdpClient{protoClient: proto, connectTimeout: timeout}
+	stream, _, err := client.initBusStream(&UdpClientOptions{ConnectTimeout: timeout})
+	if err != nil || stream == nil {
+		t.Fatalf("expected startup within two per-phase budgets, got stream=%v, err=%v", stream, err)
+	}
+}
+
+func TestStreamCommandAckDeadline(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	proto := &startupProtocol{stream: startupPipeStream{conn}, closed: make(chan struct{})}
+	defer proto.closeClient()
+	go func() {
+		_, _ = recvCommand(peer)
+		<-proto.closed // never acknowledge
+	}()
+	client := &SshUdpClient{protoClient: proto, connectTimeout: 100 * time.Millisecond}
+	start := time.Now()
+	if _, err := client.newStream("session"); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected command ack deadline, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("command ack did not honor ConnectTimeout")
+	}
+}
+
+func TestDialResponseDeadline(t *testing.T) {
+	for _, withTimeout := range []bool{true, false} {
+		t.Run(fmt.Sprintf("timeout=%v", withTimeout), func(t *testing.T) {
+			conn, peer := net.Pipe()
+			defer peer.Close()
+			client := &SshUdpClient{connectTimeout: 50 * time.Millisecond}
+			go func() {
+				var msg dialMessage
+				_ = recvMessage(peer, &msg)
+				// never respond
+			}()
+			stream := startupPipeStream{conn}
+			dialTimeout := time.Duration(0)
+			if withTimeout {
+				dialTimeout = 50 * time.Millisecond
+			}
+			defer client.setDialDeadline(stream, dialTimeout)()
+			_ = sendMessage(stream, &dialMessage{Net: "tcp", Addr: "x:1"})
+			done := make(chan error, 1)
+			go func() {
+				var resp dialResponse
+				done <- recvResponse(stream, &resp)
+			}()
+			select {
+			case err := <-done:
+				if !withTimeout || !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("unexpected dial response result: %v", err)
+				}
+			case <-time.After(500 * time.Millisecond):
+				if withTimeout {
+					t.Fatal("dial response did not honor dial timeout + ConnectTimeout")
+				}
+				_ = conn.Close()
+			}
+		})
 	}
 }
