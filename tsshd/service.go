@@ -139,10 +139,11 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 	}
 
 	info := &ServerInfo{
-		ServerVer: kTsshdVersion,
-		ProtoVer:  kTsshdProtocol,
-		Port:      port,
-		MTU:       args.MTU,
+		ServerVer:    kTsshdVersion,
+		ProtoVer:     kTsshdProtocol,
+		Port:         port,
+		MTU:          args.MTU,
+		frontendConn: conn,
 	}
 
 	proxy, err := startServerProxy(args, info, conn)
@@ -169,6 +170,7 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 		go serveQUIC(args, proxy, listener, initialPacketSize)
 	}
 
+	info.AddressFamily = conn.addressFamily()
 	infoStr, err := json.Marshal(info)
 	if err != nil {
 		return nil, "", fmt.Errorf("json marshal failed: %v", err)
@@ -260,12 +262,11 @@ func canListenOnIP(args *tsshdArgs, udpAddr *net.UDPAddr) bool {
 }
 
 func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
+	ipv4Only := args.IPv4 && !args.IPv6
+	ipv6Only := !args.IPv4 && args.IPv6
 	if sshConnection := os.Getenv("SSH_CONNECTION"); sshConnection != "" {
 		if tokens := strings.Fields(sshConnection); len(tokens) >= 3 {
 			ip := tokens[2]
-			if strings.HasPrefix(strings.ToLower(ip), "::ffff:") {
-				ip = ip[7:]
-			}
 			var addr string
 			if !strings.HasPrefix(ip, "[") && strings.ContainsRune(ip, ':') {
 				addr = fmt.Sprintf("[%s]:0", ip)
@@ -273,15 +274,16 @@ func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
 				addr = fmt.Sprintf("%s:0", ip)
 			}
 			udpAddr, err := net.ResolveUDPAddr("udp", addr)
-			if err == nil && canListenOnIP(args, udpAddr) {
-				return []*net.UDPAddr{udpAddr}, nil
+			if err == nil {
+				family := listenerAddressFamily(udpAddr)
+				if (!ipv4Only || family == "inet") && (!ipv6Only || family == "inet6") && canListenOnIP(args, udpAddr) {
+					return []*net.UDPAddr{udpAddr}, nil
+				}
 			}
 		}
 	}
 
 	var udpAddrs []*net.UDPAddr
-	ipv4Only := args.IPv4 && !args.IPv6
-	ipv6Only := !args.IPv4 && args.IPv6
 	addListenableAddr := func(ip net.IP, zone string) {
 		if ip.To4() != nil { // ipv4
 			if ipv6Only {
@@ -320,6 +322,9 @@ func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
 	}
 
 	if len(udpAddrs) == 0 {
+		if ipv4Only || ipv6Only {
+			return nil, fmt.Errorf("no listenable address for the requested IP family (ipv4=%t, ipv6=%t)", ipv4Only, ipv6Only)
+		}
 		udpAddr, err := net.ResolveUDPAddr("udp", ":0")
 		if err != nil {
 			return nil, err
@@ -397,7 +402,11 @@ func udpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err 
 		}
 		connList = append(connList, conn)
 	}
-	return &udpFrontendConn{connList: connList}, nil
+	families := make([]string, 0, len(connList))
+	for _, conn := range connList {
+		families = append(families, listenerAddressFamily(conn.LocalAddr()))
+	}
+	return &udpFrontendConn{connList: connList, listenFamily: commonAddressFamily(families)}, nil
 }
 
 func tcpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
