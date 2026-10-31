@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
@@ -191,10 +192,13 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 		return
 	}
 
-	udpClient.protoClient, err = newProtoClient(opts, udpClient)
+	protoClient, err := newProtoClient(opts, udpClient)
 	if err != nil {
 		return
 	}
+	// Failed protocol constructors can return a typed nil. Only publish a live
+	// client so deferred cleanup never calls methods through that nil pointer.
+	udpClient.protoClient = protoClient
 
 	if udpClient.enableDebugging {
 		udpClient.activeChecker.onTimeout(func() {
@@ -213,41 +217,71 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	}
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
-	busStream, err := doWithTimeout(func() (Stream, error) { return udpClient.newStream("bus") }, opts.ConnectTimeout)
+	busStream, resp, err := udpClient.initBusStream(opts)
 	if err != nil {
-		err = fmt.Errorf("new bus stream failed: %w", err)
-		return
-	}
-
-	err = sendMessage(busStream, busMessage{
-		ClientVer:        kTsshdVersion,
-		ProtoVer:         udpClient.protoVersion,
-		SessionName:      opts.SessionName,
-		AliveTimeout:     opts.AliveTimeout,
-		IntervalTime:     opts.IntervalTime,
-		HeartbeatTimeout: opts.HeartbeatTimeout})
-	if err != nil {
-		_ = busStream.Close()
-		err = fmt.Errorf("send bus message failed: %w", err)
-		return
-	}
-
-	var resp busResponse
-	err = recvResponse(busStream, &resp)
-	if err != nil {
-		_ = busStream.Close()
-		err = fmt.Errorf("bus stream init failed: %w", err)
 		return
 	}
 	udpClient.debug("bus response next session id: %d", resp.NextSessionID)
 	udpClient.sessionID.Store(resp.NextSessionID)
 
+	// Automatic KCP rekey can already be waiting for the bus. Publish all bus
+	// state under its mutex, and initialize the acknowledgement channel before
+	// starting the reader, which may receive an immediate server event.
+	udpClient.busMutex.Lock()
 	udpClient.busStream, udpClient.busClosed = busStream, make(chan struct{})
-	go udpClient.handleBusEvent()
-
 	udpClient.activeAckChan = make(chan int64, 1)
+	udpClient.busMutex.Unlock()
+	go udpClient.handleBusEvent()
 	go udpClient.keepAlive(opts.IntervalTime)
 
+	return
+}
+
+func (c *SshUdpClient) initBusStream(opts *UdpClientOptions) (stream Stream, resp busResponse, err error) {
+	// Cover stream acquisition, command acknowledgement, request writes and the
+	// response with one budget. Closing the protocol interrupts blocked I/O (and
+	// smux.OpenStream), rather than leaving a timeout-wrapper goroutine behind.
+	closed := make(chan struct{})
+	timer := time.AfterFunc(opts.ConnectTimeout, func() {
+		_ = c.protoClient.closeClient()
+		close(closed)
+	})
+	defer func() {
+		// Disarm startup cancellation before publishing the long-lived bus, or
+		// join an already-running cancellation before returning its error.
+		if !timer.Stop() {
+			<-closed
+			err = fmt.Errorf("bus stream init timeout [%v]: %w", opts.ConnectTimeout, context.DeadlineExceeded)
+		}
+		if err != nil && stream != nil {
+			_ = stream.Close()
+			stream = nil
+		}
+	}()
+
+	stream, err = c.newStream("bus")
+	if err != nil {
+		err = fmt.Errorf("new bus stream failed: %w", err)
+		return
+	}
+
+	err = sendMessage(stream, busMessage{
+		ClientVer:        kTsshdVersion,
+		ProtoVer:         c.protoVersion,
+		SessionName:      opts.SessionName,
+		AliveTimeout:     opts.AliveTimeout,
+		IntervalTime:     opts.IntervalTime,
+		HeartbeatTimeout: opts.HeartbeatTimeout})
+	if err != nil {
+		err = fmt.Errorf("send bus message failed: %w", err)
+		return
+	}
+
+	err = recvResponse(stream, &resp)
+	if err != nil {
+		err = fmt.Errorf("bus stream init failed: %w", err)
+		return
+	}
 	return
 }
 
